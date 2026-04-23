@@ -1,877 +1,375 @@
-# PricerLBSugar #11 — Architecture Document
-
-**Product:** ICE Sugar #11 (SB) Derivatives Risk & Pricing Platform  
-**Version:** 1.0  
-**Classification:** Internal — Trading Desk  
-**Author:** Hugo Berthelier  
-**Date:** April 2026
+# System Architecture — PricerLB Sugar #11
+**Version:** 1.0 | **Asset Class:** Agricultural Commodities — ICE Sugar #11 (SB) | **Model:** Black-76
 
 ---
 
-## Table of Contents
+## 1. Executive Overview
 
-1. [System Overview](#1-system-overview)
-2. [Repository Structure](#2-repository-structure)
-3. [Module Architecture](#3-module-architecture)
-4. [Data Architecture](#4-data-architecture)
-5. [Financial Models](#5-financial-models)
-6. [Data Flows](#6-data-flows)
-7. [External Dependencies](#7-external-dependencies)
-8. [Configuration & Constants](#8-configuration--constants)
-9. [Risk Management Framework](#9-risk-management-framework)
-10. [Performance & Scalability](#10-performance--scalability)
-11. [Operational Runbook](#11-operational-runbook)
-12. [Known Limitations & Roadmap](#12-known-limitations--roadmap)
+PricerLBSugar#11 is a single-dealer risk management and pricing platform for ICE Sugar #11 (SB) options and futures, covering three managed client accounts. It provides real-time Greeks aggregation, P&L attribution, implied volatility surface construction, and a multi-leg strategy pricer — all within a unified, session-aware dashboard.
+
+The system is organized around a **thin orchestration layer** (`Cockpit.py`) that delegates all quantitative logic to four specialized modules. Market data flows from **two sources**: implied volatility smiles are ingested from **Barchart Cmdty** manual exports, while daily futures prices and EUR/USD rates are fetched automatically from **Yahoo Finance** via a scheduled `API_intern.py` pipeline. Data persistence relies on Excel workbooks, enabling lightweight deployment with no database infrastructure.
 
 ---
 
-## 1. System Overview
+## 2. High-Level System Architecture
 
-### 1.1 Purpose
+```mermaid
+graph TB
+    User(["Trader / Risk Manager\n(Browser — localhost:8501)"])
 
-PricerLBSugar#11 is a **single-desk derivatives pricing and risk management platform** built for ICE Sugar #11 (SB) futures and options. The system enables a commodity options trader to:
+    subgraph App["PricerLBSugar#11 Application Layer  ·  Streamlit Runtime"]
+        direction TB
+        Cockpit["Cockpit.py\nOrchestration & Session State\nPage routing · Market input management"]
 
-- Price and monitor a multi-account portfolio of futures and vanilla options
-- Compute and aggregate all first- and second-order Greeks in real time
-- Analyze the implied volatility surface across the full forward curve
-- Generate delta hedging recommendations and estimate hedge cost
-- Attribute live and realized P&L across risk factors (Delta, Gamma, Vega, Theta)
-- Track realized performance and compute risk-adjusted return metrics
+        subgraph Pages["Presentation Layer — 4 Modules"]
+            P1["Main Book\nOpen Positions & Greeks"]
+            P2["Closed Positions\nP&L Analytics & Reporting"]
+            P3["Volatility Tools\nSurface & Smile Analysis"]
+            P4["Strategy Pricer\nMulti-leg Builder"]
+        end
 
-### 1.2 Instrument Specifications
+        subgraph Engine["Quantitative Engine"]
+            GM["GreeksManagement.py\nBlack-76 Pricing Engine\n──────────────────────\nFull Greeks · PnL Attribution\nDelta Hedge Advisor\nPortfolio Aggregation"]
+            PL["PnLComputation.py\nRisk & Performance Analytics\n──────────────────────\nEquity Curve · Sharpe Ratio\nMax Drawdown · Win Rate\nYTD / Inception Attribution\nEUR/USD FX Conversion"]
+            VOL["vol.py\nVolatility Surface Engine\n──────────────────────\nSmile Construction · Term Structure\nRisk Reversal · Butterfly\n3D Surface · Mispricing Map\n20d Realized Vol vs IV"]
+            SM["SavingsManagement.py\nData Access Layer\n──────────────────────\nPositions I/O\nExcel Read / Write"]
+            API["API_intern.py\nMarket Data Pipeline\n──────────────────────\nyfinance: EURUSD=X · SB=F\n20d Realized Vol computation\nWindows Task Scheduler"]
+        end
+    end
 
-| Parameter | Value |
-|-----------|-------|
-| Exchange | ICE Futures US (IFUS) |
-| Product Code | SB (Sugar #11) |
-| Underlying | Raw Cane Sugar |
-| Contract Size | 112,000 lbs per lot |
-| Quotation | US cents / lb |
-| Tick Size | 0.01 ¢/lb |
-| Tick Value | USD 11.20 per contract |
-| Settlement | Physical delivery |
-| Active Months | H (Mar), K (May), N (Jul), V (Oct) |
-| Expiry Logic | Last business day of month preceding delivery |
+    subgraph DataLayer["Persistence Layer — Excel Workbooks"]
+        direction LR
+        subgraph Books["books/  ·  Position Store"]
+            B1["95135/\nbook.xlsx · closed_book.xlsx"]
+            B2["95136/\nbook.xlsx · closed_book.xlsx"]
+            B3["95137/\nbook.xlsx · closed_book.xlsx"]
+        end
+        subgraph VolStore["vol/  ·  Implied Volatility Store\n(Barchart Cmdty — manual export)"]
+            V1["VolHbarchart.xlsx  — Mar (H)"]
+            V2["VolKbarchart.xlsx  — May (K)"]
+            V3["VolNbarchart.xlsx  — Jul (N)"]
+            V4["VolVbarchart.xlsx  — Oct (V)"]
+        end
+        subgraph APIData["API_data/  ·  Market Data Store\n(Yahoo Finance — auto-updated)"]
+            A1["FX.xlsx\nEUR/USD daily OHLC"]
+            A2["HistVolSB.xlsx\nSB=F daily prices\n+ 20d realized vol"]
+        end
+    end
 
-### 1.3 Account Structure
+    User -->|"HTTP / WebSocket"| Cockpit
+    Cockpit --> P1 & P2 & P3 & P4
 
-| Account ID | Description |
-|------------|-------------|
-| 95135 | Client account 1 |
-| 95136 | Client account 2 |
-| 95137 | Client account 3 |
+    P1 --> GM & SM
+    P2 --> PL & SM
+    P3 --> VOL
+    P4 --> GM
 
-### 1.4 Covered Maturities
-
-The system covers all active expiries from **H26 (March 2026)** through **V34 (October 2034)**, with precise first-notice dates hardcoded for each month.
-
----
-
-## 2. Repository Structure
-
-```
-PricerLBSugar#11/
-│
-├── Cockpit.py                   # Main Streamlit dashboard — UI orchestration
-├── GreeksManagement.py          # Black-76 pricing engine & Greeks computation
-├── PnLComputation.py            # Realized P&L analytics & performance metrics
-├── SavingsManagement.py         # Position persistence (Excel read/write)
-├── API_intern.py                # Daily market data ingestion pipeline
-├── vol.py                       # Implied volatility surface analysis
-│
-├── API_data/
-│   ├── FX.xlsx                  # EUR/USD daily OHLC (auto-updated)
-│   └── HistVolSB.xlsx           # SB=F daily prices + 20d realized vol
-│
-├── books/
-│   ├── 95135/
-│   │   ├── book.xlsx            # Open positions ledger
-│   │   └── closed_book.xlsx     # Realized trade history
-│   ├── 95136/
-│   │   ├── book.xlsx
-│   │   └── closed_book.xlsx
-│   └── 95137/
-│       ├── book.xlsx
-│       └── closed_book.xlsx
-│
-├── vol/
-│   ├── VolHbarchart.xlsx        # Implied vol smile — H (March) expiry
-│   ├── VolKbarchart.xlsx        # Implied vol smile — K (May) expiry
-│   ├── VolNbarchart.xlsx        # Implied vol smile — N (July) expiry
-│   └── VolVbarchart.xlsx        # Implied vol smile — V (October) expiry
-│
-├── EmergencySavings/            # Manual position backup directory
-├── ProductSpec_23.pdf           # ICE Sugar #11 contract specification
-└── logo_feedalliance_couleur1.png
+    SM -->|"pandas read_excel / to_excel"| Books
+    VOL -->|"pandas read_excel"| VolStore
+    VOL -->|"pandas read_excel"| APIData
+    PL -->|"pandas read_excel"| APIData
+    API -->|"yfinance.download → to_excel"| APIData
 ```
 
 ---
 
-## 3. Module Architecture
+## 3. Data Pipeline
 
-### 3.1 High-Level Dependency Graph
+```mermaid
+flowchart LR
+    subgraph Sources["External Data Sources"]
+        YF_FX["Yahoo Finance\nEURUSD=X\nDaily OHLC"]
+        YF_SB["Yahoo Finance\nSB=F\nDaily close prices"]
+        XLS_VOL["Barchart Cmdty\nVol*.xlsx\nImplied Vol Smiles\n(manual export)"]
+        XLS_POS["book.xlsx\nclosed_book.xlsx\nPosition Store\n(manual entry)"]
+    end
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                        Cockpit.py                            │
-│                   (Streamlit Dashboard)                      │
-│   ┌────────────┐  ┌──────────┐  ┌───────┐  ┌────────────┐  │
-│   │ Main Book  │  │ Vol Tools│  │Pricer │  │ P&L Report │  │
-│   └─────┬──────┘  └────┬─────┘  └───┬───┘  └──────┬─────┘  │
-└─────────┼──────────────┼────────────┼──────────────┼────────┘
-          │              │            │              │
-   ┌──────▼──────┐  ┌────▼────┐      │       ┌──────▼──────┐
-   │  Greeks     │  │ vol.py  │      │       │  PnLCompu-  │
-   │ Management  │  │         │      │       │  tation.py  │
-   │ .py         │  │         │      │       │             │
-   └──────┬──────┘  └────┬────┘      │       └──────┬──────┘
-          │              │            │              │
-          └──────────────┴────────────┴──────────────┘
-                                  │
-                    ┌─────────────▼──────────────┐
-                    │    SavingsManagement.py     │
-                    │   (Excel I/O abstraction)   │
-                    └─────────────┬──────────────┘
-                                  │
-                    ┌─────────────▼──────────────┐
-                    │       Excel Data Layer      │
-                    │  books/ · vol/ · API_data/  │
-                    └─────────────┬──────────────┘
-                                  │
-                    ┌─────────────▼──────────────┐
-                    │      API_intern.py          │
-                    │  (Daily Scheduled Ingestion)│
-                    │  yfinance: EURUSD=X, SB=F   │
-                    └────────────────────────────┘
-```
+    subgraph Ingestion["Ingestion & Parsing"]
+        API_PIPE["API_intern.py\nScheduled pipeline\n(Windows Task Scheduler)\nyfinance.download()"]
+        IO["SavingsManagement\nread_excel · dtype enforcement\ndate parsing · account routing"]
+        PARSE_VOL["vol.py\nColumn remapping\nStrike / Delta extraction\nExpiry tagging"]
+        PARSE_API["vol.py / PnLComputation.py\nread_excel(FX.xlsx)\nread_excel(HistVolSB.xlsx)"]
+    end
 
----
+    subgraph Compute["Quantitative Processing"]
+        DF_POS[("DataFrame\nOpen / Closed\nPositions")]
+        DF_VOL[("DataFrame\nImplied Vol\nSurface Panel")]
+        DF_FX[("DataFrame\nEUR/USD rate\nfor P&L conversion")]
+        DF_RV[("DataFrame\nSB=F prices\n20d Realized Vol")]
 
-### 3.2 Cockpit.py — Dashboard Controller
+        TTM["TTM Computation\nACT/365 · ICE First-Notice Dates"]
+        BLACK76["Black-76 Pricing Engine\nper-instrument vectorized pricing"]
+        GREEKS["Greeks Computation\nΔ Γ ν Θ ρ · Vanna · Volga · Charm"]
+        EXPLAIN["P&L Attribution Engine\nΔ PnL · Γ PnL · ν PnL · Θ PnL · Residual"]
+        RV_COMP["Realized Vol\nstd(log-returns, 20d) × √252"]
+        SMILE["Smile Analytics\nATM IV · RR · BF · Skew · Curvature"]
+        SURFACE["3D Surface Interpolation\nStrike × Expiry × IV"]
+        MISPRICE["Mispricing Map\nIV(K) − IV_ATM  per expiry"]
+    end
 
-**Role:** Top-level Streamlit application. Orchestrates all pages, manages session state, dispatches user inputs to the appropriate pricing/analytics modules.
+    subgraph Presentation["Streamlit UI Layer"]
+        UI_BOOK["Main Book\nGreeks tables · Delta/Gamma/Vega/Theta charts\nHedge advisor · Live PnL"]
+        UI_PNL["P&L Reports\nEquity curve · Monthly bars\nPerformance KPIs · EUR conversion"]
+        UI_VOL["Vol Tools\nSmile panel · Term structure\nSkew metrics · 3D surface\nIV vs 20d RV comparison"]
+        UI_PRICER["Strategy Pricer\nMulti-leg builder · Per-leg Greeks"]
+    end
 
-**Dashboard Pages:**
+    YF_FX -->|"yfinance (14d)"| API_PIPE
+    YF_SB -->|"yfinance (1y)"| API_PIPE
+    API_PIPE -->|"to_excel"| PARSE_API
+    XLS_VOL -->|"read_excel"| PARSE_VOL
+    XLS_POS -->|"read_excel"| IO
 
-| Page | Function | Key Outputs |
-|------|----------|-------------|
-| Main Book | Portfolio valuation, Greeks, hedging | Delta/Gamma/Vega/Theta tables, hedge recommendations, live P&L |
-| Volatility Tools | IV surface & smile analytics | 2D smiles, 3D surface, term structure, skew metrics, RV |
-| Pricer — Strategy | Strategy pricer (partially implemented) | Black-76 multi-leg pricing |
-| Closed Positions & P&L | Realized performance analytics | Equity curve, Sharpe, Max Drawdown, win rate |
+    IO --> DF_POS
+    PARSE_VOL --> DF_VOL
+    PARSE_API --> DF_FX & DF_RV
 
-**Key Constants Declared Here:**
+    DF_POS --> TTM --> BLACK76
+    DF_VOL -->|"σ(K, T)"| BLACK76
 
-```python
-CONTRACT_MULTIPLIER = 112_000          # lbs per contract
-DEFAULT_VOL          = { "H27": 0.20,  # Fallback IV by expiry
-                         "K26": 0.20, ... }
-EXPIRY_DATES         = { 2026: {3: 13, 5: 14, 7: 14, 10: 14}, ... }
-accounts             = { "95135": {...}, "95136": {...}, "95137": {...} }
-```
+    BLACK76 --> GREEKS --> UI_BOOK
+    BLACK76 --> EXPLAIN --> UI_BOOK
+    GREEKS --> UI_PRICER
 
----
+    DF_POS --> EXPLAIN
+    DF_POS --> UI_PNL
+    DF_FX --> UI_PNL
 
-### 3.3 GreeksManagement.py — Pricing Engine
-
-**Role:** Core quantitative library. Implements the Black-76 model for European futures options. Computes all eight Greeks, aggregates by expiry, and provides hedging advisory output.
-
-#### 3.3.1 Pricing Model: Black-76
-
-For a European option on a futures contract:
-
-```
-d₁ = [ ln(F/K) + (σ²/2)·T ] / (σ·√T)
-d₂ = d₁ - σ·√T
-
-Call = exp(-r·T) · [ F·N(d₁) - K·N(d₂) ]
-Put  = exp(-r·T) · [ K·N(-d₂) - F·N(-d₁) ]
-```
-
-Where:
-- `F` = futures price (spot quotation, ¢/lb)
-- `K` = strike price
-- `σ` = implied volatility (decimal, annualized)
-- `T` = time to expiry (ACT/252 years)
-- `r` = risk-free rate (2%, continuous)
-- `N(·)` = standard normal CDF
-
-#### 3.3.2 Greeks Catalog
-
-| Greek | Symbol | Formula | Unit | Use |
-|-------|--------|---------|------|-----|
-| Delta | Δ | N(d₁) / N(d₁)-1 | ratio | Directional hedge sizing |
-| Gamma | Γ | n(d₁) / (F·σ·√T) | 1/price | Convexity, re-hedge frequency |
-| Vega | ν | F·n(d₁)·√T | cts/1% IV | Vol exposure by expiry |
-| Theta | Θ | -F·n(d₁)·σ/(2√T)/252 | USD/day | Daily time decay |
-| Rho | ρ | -T·V | USD/1%r | Interest rate sensitivity |
-| Vanna | Vα | √T·n(d₁)·[1 - d₁/(σ√T)] | mixed | Delta sensitivity to vol |
-| Volga | Vο | F·√T·n(d₁)·d₁·d₂/σ | mixed | Smile/convexity exposure |
-| Charm | Χ | -n(d₁)/(2T) | ratio/day | Delta decay toward expiry |
-
-#### 3.3.3 Public API
-
-```python
-# Single-position Greeks (pure functions, O(1))
-single_delta(F, K, T, sigma, r, option_type)
-single_gamma(F, K, T, sigma, r)
-single_vega(F, K, T, sigma, r)
-single_theta(F, K, T, sigma, r, option_type)
-single_rho(F, K, T, sigma, r, option_type, qty, mult)
-single_vanna(F, K, T, sigma, r)
-single_volga(F, K, T, sigma, r)
-single_charm(F, K, T, sigma, r, option_type)
-
-# Portfolio aggregation by expiry
-portfolio_delta_by_expiry(df)    # → {expiry: Δ_total}
-portfolio_gamma_by_expiry(df)
-portfolio_vega_by_expiry(df)
-portfolio_theta_by_expiry(df)
-
-# Hedging advisory
-delta_hedge_action_by_expiry(df)     # → {expiry: ("Buy"|"Sell"|"Hold", qty)}
-hedge_cash_cost_by_expiry(df, prices)# → {expiry: USD_cost}
-
-# Visualization (Plotly)
-plot_delta_vs_future_subplots(df, ±10% range)
-plot_gamma_vs_future_subplots(df, ±10% range)
-plot_vega_vs_future_subplots(df, ±10% range)
-plot_theta_vs_future_subplots(df, ±10% range)
-
-# P&L engine
-compute_live_pnl(df, prices, vols)      # Mark-to-market
-compute_pnl_explain(df, old, new)       # Attribution: Δ/Γ/ν/Θ
+    DF_RV --> RV_COMP --> UI_VOL
+    DF_VOL --> SMILE --> UI_VOL
+    DF_VOL --> SURFACE --> UI_VOL
+    DF_VOL --> MISPRICE --> UI_VOL
 ```
 
 ---
 
-### 3.4 vol.py — Volatility Surface Engine
+## 4. Market Data Pipeline — API_intern.py
 
-**Role:** Load, clean, interpolate, and visualize the implied volatility surface across all active expiries. Compute smile metrics (Risk Reversal, Butterfly, Put Skew) and realized volatility.
+```mermaid
+flowchart TD
+    subgraph Trigger["Scheduled Trigger"]
+        SCHED["Windows Task Scheduler\nBusiness days · 08:00"]
+    end
 
-#### 3.4.1 Pipeline
+    subgraph Pipeline["API_intern.py — Sequential Steps"]
+        S1["Step 1 — EUR/USD\nyfinance.download('EURUSD=X', period='14d')\nFields: Open · High · Low · Close · Volume"]
+        SLEEP["sleep(3s)\nYahoo Finance rate-limiting"]
+        S2["Step 2 — Sugar #11\nyfinance.download('SB=F', period='1y')\nFields: Open · High · Low · Close · Volume"]
+        COMPUTE["Realized Vol Computation\nrets = close.pct_change()\nvol_CtoC_20d = rets.rolling(20).std() × √252"]
+    end
 
-```
-VolH/K/N/V barchart.xlsx
-        │
-        ▼
-load_raw_vol_data()         # pd.read_excel per expiry
-        │
-        ▼
-clean_vol_data()            # "27.5%" → 0.275 · "117.25s" → 117.25
-        │
-        ▼
-add_smile_metrics_black76() # IV_Mid, Delta_Signed, Delta_Abs
-        │
-        ├──────────────────────────────────────────────────┐
-        ▼                                                  ▼
-build_vol_surface_matrix()              compute_atm_term_structure()
-  K_grid: linspace(K_min, K_max, 60)     IV at F by expiry
-  IV:     2D array (T × K)
-  Interp: linear/bilinear, no extrap
-```
+    subgraph Output["Outputs (API_data/)"]
+        FX_OUT["FX.xlsx\nEUR/USD daily OHLC\n(last 14 days, rolling)"]
+        SB_OUT["HistVolSB.xlsx\nSB=F daily close prices\nlog-returns · 20d annualized RV"]
+    end
 
-#### 3.4.2 Smile Metrics
+    subgraph Consumers["Downstream Consumers"]
+        C1["PnLComputation.py\nEUR/USD latest rate\n→ P&L in EUR"]
+        C2["vol.py\nSB=F price history\n20d RV vs ATM IV chart"]
+    end
 
-```
-Risk Reversal (RR_Δ)  =  IV_Call(+Δ) - IV_Put(-Δ)      [skew direction]
-Butterfly (BF_Δ)      =  0.5·(IV_Call + IV_Put) - IV_ATM [smile curvature]
-Put Skew              =  IV_Put(Δ) - IV_ATM               [downside premium]
-
-Slope_Left   = (IV_ATM - IV_Put) / Δ
-Slope_Right  = (IV_Call - IV_ATM) / Δ
-Curvature    =  IV_Call + IV_Put - 2·IV_ATM
-Vol Misprice = IV(K) - IV_ATM                             [heatmap]
-```
-
-Computed at **10Δ** and **25Δ** for each active expiry.
-
-#### 3.4.3 Visualization Functions
-
-| Function | Output | Mode |
-|----------|--------|------|
-| `plot_smiles_panel()` | 2D smile per expiry | Strike / Signed Δ / Abs Δ |
-| `plot_vol_surface()` | 3D IV surface | Plotly 3D mesh |
-| `plot_atm_term_structure()` | ATM IV vs T | Line chart |
-| `plot_skew_bars()` | RR, BF, PutSkew bars | Bar chart (10Δ & 25Δ) |
-| `plot_shape_lines()` | Slope & curvature | Line chart |
-| `plot_vol_mispricing_heatmap()` | IV − IV_ATM | Heatmap |
-
----
-
-### 3.5 PnLComputation.py — Performance Analytics
-
-**Role:** Compute, aggregate, and analyze realized P&L from closed trades. Produce risk-adjusted performance metrics.
-
-#### 3.5.1 Data Model (closed_book.xlsx)
-
-| Column | Type | Description |
-|--------|------|-------------|
-| trade_id | str | Unique trade identifier |
-| date | date | Trade close date |
-| open_date | date | Trade entry date |
-| underlying | str | "SB" |
-| type | str | "fut", "call", "put" |
-| expiry | str | "H26", "K26", … |
-| quantity | float | Signed lot size |
-| strike | float | Strike (options only) |
-| price/premium | float | Entry price (¢/lb) |
-| end_price | float | Exit price (¢/lb) |
-| cost | float | Commissions & fees |
-
-#### 3.5.2 P&L Formula
-
-```
-PnL (trade) = (end_price − entry_price) × quantity × 112,000
-              − cost
-
-PnL (portfolio) = Σ PnL (trade)
-```
-
-#### 3.5.3 Aggregation Methods
-
-| Dimension | Function | Output |
-|-----------|----------|--------|
-| Per trade | `compute_line_pnl()` | PnL, holding_days, data_ok |
-| By expiry | `compute_pnl_by_expiry()` | PnL sum, trade count |
-| By month | `compute_pnl_by_month()` | Monthly P&L |
-| By year | `compute_pnl_by_year()` | Annual P&L |
-| Daily cumulative | `build_daily_pnl_series()` | Equity curve |
-| YTD cumulative | `build_daily_pnl_series_by_year()` | Per-year equity curve |
-
-#### 3.5.4 Risk Metrics
-
-```python
-Sharpe Ratio     = √252 · mean(excess_returns) / std(returns)
-Max Drawdown     = min( (equity_t / peak_t) − 1 )
-Win Rate         = count(PnL > 0) / total_trades
+    SCHED --> S1 --> SLEEP --> S2 --> COMPUTE
+    S1 -->|"to_excel"| FX_OUT
+    COMPUTE -->|"to_excel"| SB_OUT
+    FX_OUT --> C1
+    SB_OUT --> C2
 ```
 
 ---
 
-### 3.6 SavingsManagement.py — Persistence Layer
+## 5. Pricing Model — Black-76
 
-**Role:** Thin abstraction over Excel-based position storage. Isolates all file I/O from business logic.
+```mermaid
+flowchart TD
+    subgraph Inputs["Model Inputs"]
+        IN["F  — Futures price (¢/lb, market)\nK  — Strike price\nT  — Time to maturity  [ACT/365]\nr  — Risk-free rate (default 2%)\nσ  — Implied volatility  [smile interpolated]\ntype — call | put | fut"]
+    end
 
-```python
-load_open_positions(account_id: str)  → pd.DataFrame
-save_open_positions(account_id: str, df: pd.DataFrame) → None
-```
+    subgraph Intermediates["Intermediate Computations"]
+        D1["d₁ = [ ln(F/K) + ½σ²T ] / σ√T"]
+        D2["d₂ = d₁ − σ√T"]
+        DISC["Discount factor = e^(−rT)"]
+    end
 
-**Storage Paths:**
-```
-books/{account_id}/book.xlsx         # Open positions
-books/{account_id}/closed_book.xlsx  # Closed trades
-```
+    subgraph Pricing["Option Price"]
+        CALL_PRICE["Call = e^(−rT) · [ F·N(d₁) − K·N(d₂) ]"]
+        PUT_PRICE["Put  = e^(−rT) · [ K·N(−d₂) − F·N(−d₁) ]"]
+    end
 
----
+    subgraph Greeks["First & Second Order Greeks"]
+        G1["Δ (Delta)   = e^(−rT) · N(d₁)"]
+        G2["Γ (Gamma)   = e^(−rT) · N'(d₁) / (F·σ·√T)"]
+        G3["ν (Vega)    = F · e^(−rT) · N'(d₁) · √T"]
+        G4["Θ (Theta)   = −[F·σ·e^(−rT)·N'(d₁)] / (2√T·252)"]
+        G5["ρ (Rho)     = −T · option_price"]
+        G6["Vanna        = −e^(−rT) · N'(d₁) · d₂/σ"]
+        G7["Volga        = F · e^(−rT) · N'(d₁) · √T · d₁·d₂/σ"]
+        G8["Charm        = −e^(−rT) · N'(d₁) · [2rT − d₂·σ·√T] / (2T·σ·√T)"]
+    end
 
-### 3.7 API_intern.py — Market Data Ingestion
+    subgraph PnLExplain["P&L Attribution (Taylor Expansion)"]
+        PNL["PnL ≈  Δ·ΔF  +  ½Γ·ΔF²  +  ν·Δσ  +  Θ·Δt  +  residual"]
+    end
 
-**Role:** Scheduled data pipeline that downloads and persists daily market data from Yahoo Finance.
-
-**Schedule:** Windows Task Scheduler — business days, market open
-
-| Step | Ticker | Fields | Output |
-|------|--------|--------|--------|
-| 1 | EURUSD=X | OHLC, last 14d | API_data/FX.xlsx |
-| 2 | (pause 3s) | — | rate-limiting |
-| 3 | SB=F | OHLC + rolling vol, last 365d | API_data/HistVolSB.xlsx |
-
-**Computed fields on SB=F:**
-```python
-rets         = close.pct_change()
-vol_CtoC_20d = rets.rolling(20).std() * sqrt(252)   # annualized
-```
-
----
-
-## 4. Data Architecture
-
-### 4.1 Data Sources
-
-| Source | Type | Data | Update | Format |
-|--------|------|------|--------|--------|
-| Yahoo Finance | REST API (yfinance) | EUR/USD, SB=F prices | Daily (auto) | In-memory → Excel |
-| Barchart / CMDty Views | Manual export | Implied vol smiles | Ad-hoc (manual) | Excel |
-| Trader input | Manual | Open & closed positions | Real-time | Excel |
-
-### 4.2 Data Layer Layout
-
-```
-API_data/
-  FX.xlsx              EUR/USD daily OHLC — used for USD→EUR P&L conversion
-  HistVolSB.xlsx       SB=F close prices, log-returns, 20d realized vol
-
-books/
-  {acct}/book.xlsx     Open positions — live risk book
-  {acct}/closed_book.xlsx  Closed trades — realized P&L ledger
-
-vol/
-  VolH/K/N/Vbarchart.xlsx  Implied vol smile per expiry (Barchart format)
-    Columns: Δ_Call · IV_Call · Strike · IV_Put · Δ_Put
-```
-
-### 4.3 Excel Schema — Open Positions (book.xlsx)
-
-| Column | Type | Description |
-|--------|------|-------------|
-| trade_id | str | Unique position ID |
-| date | date | Entry date |
-| underlying | str | "SB" |
-| type | str | "fut" / "call" / "put" |
-| expiry | str | "H26", "K26", … |
-| quantity | float | Signed lots (+long, −short) |
-| strike | float | Strike in ¢/lb (options) |
-| price/premium | float | Entry price |
-| implied_vol | float | IV at entry (decimal) |
-
----
-
-## 5. Financial Models
-
-### 5.1 Black-76 Model
-
-Used for all options pricing and Greeks computation.
-
-**Assumptions:**
-- Log-normal distribution of futures prices
-- Constant implied volatility per option (no smile dynamics in pricing)
-- Continuous risk-free rate, no dividends
-- No transaction costs, no jumps
-
-**Day Count Convention:**
-- Time to maturity: ACT/365
-- Theta & realized vol annualization: ACT/252
-
-**Interest Rate:** `r = 2%` (hardcoded, represents approximate cost of carry)
-
-**Normal Distribution Implementation:**
-```python
-N(x)  = 0.5 · [1 + erf(x / √2)]    # CDF  — scipy-free, uses math.erf
-n(x)  = exp(-0.5·x²) / √(2π)        # PDF
-```
-
-### 5.2 Volatility Surface Construction
-
-**Interpolation:**
-- Within expiry (strike axis): piecewise linear interpolation
-- Across expiries (time axis): bilinear interpolation
-- No extrapolation beyond observed data bounds (returns NaN)
-- No arbitrage enforcement (not implemented)
-
-**Input Grid:** 60 uniformly spaced strike points between observed min/max per expiry.
-
-### 5.3 P&L Attribution Model
-
-Mark-to-market P&L is decomposed using the Taylor expansion of the option pricing function:
-
-```
-dP = Δ·dF + ½·Γ·(dF)² + ν·dσ + Θ·dt + residual
-```
-
-Where the residual captures higher-order terms, model error, and smile dynamics.
-
-### 5.4 Realized Volatility
-
-```
-r_t   = ln(Close_t / Close_{t-1})          # log-return
-σ_RV  = std(r_t, window=20) × √252          # 20-day close-to-close, annualized
-```
-
-Used as a benchmark against implied volatility to assess vol richness/cheapness.
-
----
-
-## 6. Data Flows
-
-### 6.1 Portfolio Valuation & Greeks
-
-```
-User Input
-  │  Account ID, Valuation Date, Futures Prices {expiry: F}, IVs
-  ▼
-SavingsManagement.load_open_positions()
-  │  book.xlsx → DataFrame
-  ▼
-GreeksManagement.add_ttm_column()
-  │  Expiry string → T (years) via EXPIRY_DATES lookup
-  ▼
-GreeksManagement.build_greeks_dataframe()
-  │  Per position: Δ, Γ, ν, Θ, ρ, Vα, Vο, Χ  (Black-76)
-  ▼
-portfolio_{greek}_by_expiry()
-  │  Aggregate by maturity bucket
-  ▼
-delta_hedge_action_by_expiry()
-  │  → {expiry: ("Buy"|"Sell"|"Hold", qty, USD_cost)}
-  ▼
-compute_live_pnl() + compute_pnl_explain()
-  │  Mark-to-market → Attribution: Δ/Γ/ν/Θ/residual
-  ▼
-Cockpit.py (Streamlit rendering)
-```
-
-### 6.2 Volatility Surface Analysis
-
-```
-User Input
-  │  Expiry selection, View mode (Strike/SignedΔ/AbsΔ), Shape delta
-  ▼
-vol.load_raw_vol_data()  ←  VolH/K/N/V barchart.xlsx
-  ▼
-vol.clean_vol_data()
-  │  Parse %, strings → floats; map columns
-  ▼
-vol.add_smile_metrics_black76()
-  │  IV_Mid, Delta_Signed, Delta_Abs
-  ▼
-┌──────────────────────────────────────────────────────┐
-│  build_vol_surface_matrix()    compute_atm_ts()      │
-│  compute_skew_metrics()        plot functions        │
-└──────────────────────────────────────────────────────┘
-  ▼
-Historical Volatility
-  │  API_data/HistVolSB.xlsx → vol_CtoC_20d + returns histogram
-  ▼
-Cockpit.py (Plotly visualizations)
-```
-
-### 6.3 Realized P&L Analytics
-
-```
-User Input
-  │  Account ID
-  ▼
-PnLComputation.load_closed_positions()  ←  closed_book.xlsx
-  ▼
-compute_line_pnl()
-  │  (end_price − entry_price) × qty × 112,000 − cost
-  ▼
-Aggregation layer
-  │  By trade · by expiry · by month · by year · daily
-  ▼
-build_daily_pnl_series()  →  Equity curve
-compute_sharpe(), compute_max_drawdown()
-  ▼
-FX Conversion
-  │  API_data/FX.xlsx  →  latest EUR/USD  →  P&L (EUR)
-  ▼
-Cockpit.py (Charts + metrics)
-```
-
-### 6.4 Daily Market Data Update
-
-```
-Windows Task Scheduler (business days, 08:00)
-  ▼
-API_intern.py
-  ├── yfinance.download("EURUSD=X", period="14d")
-  │     → API_data/FX.xlsx
-  │
-  ├── sleep(3s)
-  │
-  └── yfinance.download("SB=F", period="1y")
-        compute returns + 20d realized vol
-        → API_data/HistVolSB.xlsx
+    IN --> D1 & DISC
+    D1 --> D2
+    D1 & D2 & DISC --> CALL_PRICE & PUT_PRICE
+    D1 & D2 & DISC --> G1 & G2 & G3 & G4 & G5 & G6 & G7 & G8
+    G1 & G2 & G3 & G4 --> PNL
 ```
 
 ---
 
-## 7. External Dependencies
+## 6. Session State & Reactivity Model
 
-### 7.1 Python Libraries
+```mermaid
+flowchart TD
+    subgraph Init["Initialization (first load or account change)"]
+        LOAD["load_open_positions(account_id)"]
+        TTM_C["add_ttm_column(valuation_date)"]
+        VOL_MAP["df['vol'] = expiry.map(DEFAULT_VOL)"]
+        MULT["df['contract_multiplier'] = 112_000"]
+        BUILD["build_greeks_dataframe(F_market, r=0.02)"]
+    end
 
-| Library | Purpose |
-|---------|---------|
-| `streamlit` | Web framework — dashboard UI |
-| `pandas` | DataFrame operations, Excel I/O |
-| `numpy` | Numerical arrays, vectorized math |
-| `plotly` | Interactive visualization (web-based) |
-| `matplotlib` | Static plots (fallback) |
-| `yfinance` | Market data download (Yahoo Finance) |
-| `openpyxl` | Excel read/write (.xlsx) |
-| `math` | `erf()`, `sqrt()` for normal distribution |
-| `pathlib` | Cross-platform file path handling |
-| `datetime` | Date arithmetic, TTM calculation |
+    subgraph State["st.session_state  ·  In-Memory Cache"]
+        SS1["positions  — enriched DataFrame with Greeks"]
+        SS2["F_market   — {expiry: futures_price}"]
+        SS3["current_account  — active account id"]
+        SS4["valuation_date   — pricing date"]
+    end
 
-### 7.2 External Data Sources
+    subgraph Reactivity["Reactivity Triggers"]
+        T1["Account selector change"]
+        T2["Valuation date change"]
+        T3["Futures price slider update"]
+    end
 
-| Source | Ticker / URL | Data | Auth | Latency |
-|--------|-------------|------|------|---------|
-| Yahoo Finance | `EURUSD=X` | EUR/USD daily | None (public) | ~15 min |
-| Yahoo Finance | `SB=F` | Sugar #11 front month daily | None (public) | ~15 min |
-| Barchart.com | CMDty Views export | Implied vol smiles | Manual login | Manual |
+    subgraph Pages["Downstream Consumers"]
+        P1["Main Book — Greeks, Hedge, PnL"]
+        P4["Strategy Pricer — per-leg pricing"]
+    end
 
----
+    LOAD --> TTM_C --> VOL_MAP --> MULT --> BUILD
+    BUILD --> SS1
+    T1 & T2 --> LOAD
+    T3 --> SS2
 
-## 8. Configuration & Constants
-
-### 8.1 Model Parameters
-
-| Parameter | Value | Location | Description |
-|-----------|-------|----------|-------------|
-| `CONTRACT_MULTIPLIER` | 112,000 | Cockpit.py | lbs per lot |
-| `r` | 0.02 | GreeksManagement.py | Risk-free rate (continuous) |
-| `storage_cost` | 0.02 | GreeksManagement.py | Commodity carrying cost |
-| `day_count_ttm` | 365 | GreeksManagement.py | ACT/365 for TTM |
-| `day_count_theta` | 252 | GreeksManagement.py | ACT/252 for Theta |
-| `n_strikes_grid` | 60 | vol.py | Strike interpolation grid size |
-
-### 8.2 Calendar — Expiry Dates
-
-First-notice dates by year and delivery month:
-
-```python
-FUTURES_MONTH_MAP = {"H": 3, "K": 5, "N": 7, "V": 10}
-
-EXPIRY_DATES = {
-    2026: {3: 13, 5: 14, 7: 14, 10: 14},
-    2027: {3: 12, 5: 14, 7: 14, 10: 14},
-    2028: {3: 14, 5: 14, 7: 14, 10: 14},
-    # ... through 2034
-}
-```
-
-### 8.3 Default Volatilities
-
-Fallback IV used when live smile data is unavailable:
-
-```python
-DEFAULT_VOL = {
-    "H27": 0.20,
-    "K26": 0.20,
-    "N26": 0.20,
-    "V26": 0.20,
-    # ...
-}
-```
-
-### 8.4 File Paths
-
-| Path | OS | Used By |
-|------|----|---------|
-| `/Users/hugoberthelier/Desktop/PricerLBSugar#11/books` | macOS | SavingsManagement.py |
-| `C:/PricerLb/PricerLBSugar#11/books` | Windows | SavingsManagement.py |
-| `C:/PricerLb/PricerLBSugar#11/vol/` | Windows | vol.py |
-
-> **Note:** Dual-path support for macOS and Windows present. Paths are hardcoded and must be updated manually on new deployments.
-
----
-
-## 9. Risk Management Framework
-
-### 9.1 Greeks-Based Risk Dashboard
-
-The system implements a full Greeks ladder aggregated by maturity bucket:
-
-```
-Portfolio Risk (by expiry)
-┌──────┬──────────┬──────────┬─────────┬──────────────┬────────┐
-│Expiry│  Delta   │  Gamma   │  Vega   │  Theta($/d)  │ Action │
-├──────┼──────────┼──────────┼─────────┼──────────────┼────────┤
-│ H26  │  −14.3   │  +0.023  │  +182   │  −1,240      │ Buy 14 │
-│ K26  │  +6.1    │  −0.011  │  −78    │  +560        │ Sell 6 │
-│ N26  │  +0.0    │  +0.000  │  +0     │  +0          │ Hold   │
-└──────┴──────────┴──────────┴─────────┴──────────────┴────────┘
-```
-
-### 9.2 Delta Hedging Advisory
-
-For each expiry, the system computes:
-
-```
-hedge_qty    = round( |Δ_portfolio| )
-action       = "Buy"  if Δ < −threshold
-             = "Sell" if Δ > +threshold
-             = "Hold" otherwise
-hedge_cost   = hedge_qty × F × 112,000   (USD notional)
-```
-
-### 9.3 Sensitivity Analysis
-
-Greeks vs. futures price across a ±10% price range are plotted per expiry, enabling scenario analysis:
-
-- Delta profile (linearity check, strike proximity)
-- Gamma profile (convexity peak around ATM)
-- Vega profile (long/short vol positioning)
-- Theta profile (daily P&L under price moves)
-
-### 9.4 P&L Attribution
-
-Live P&L is decomposed into:
-
-```
-dP = Δ·dF + ½Γ·(dF)² + ν·dσ + Θ·dt + ε
-     [dir.]  [convex]  [vol]  [time]  [residual]
-```
-
-This allows instant identification of the source of any P&L surprise.
-
-### 9.5 Performance KPIs (Realized Book)
-
-| Metric | Formula |
-|--------|---------|
-| Sharpe Ratio | √252 × E[r − r_f] / σ_r |
-| Max Drawdown | min((equity_t / peak_t) − 1) |
-| Win Rate | count(PnL_trade > 0) / n_trades |
-| Annual P&L | Σ daily P&L per calendar year |
-
-### 9.6 Not Yet Implemented
-
-The following risk controls are identified as future priorities:
-
-- Value-at-Risk (VaR 95/99%) and Expected Shortfall (CVaR)
-- Stress testing (parallel/tilt shifts of vol surface, price gaps)
-- Basis risk (physical vs. futures basis)
-- Jump risk modeling
-- Hard position limits enforcement
-- Correlation / cross-commodity risk
-
----
-
-## 10. Performance & Scalability
-
-### 10.1 Computational Complexity
-
-| Operation | Complexity | Notes |
-|-----------|-----------|-------|
-| Single Greek | O(1) | Closed-form Black-76 |
-| Portfolio Greeks | O(n) | n = number of open positions |
-| Vol surface build | O(m × k) | m expiries, k strike points |
-| P&L aggregation | O(n) | n = number of closed trades |
-| Delta hedging | O(m log m) | Sort by expiry |
-
-**Expected performance:** Sub-second computation for portfolios up to ~10,000 positions.
-
-### 10.2 Scalability Limitations
-
-| Constraint | Current Limit | Bottleneck |
-|------------|--------------|------------|
-| Positions | ~500–1,000 | Excel read/write latency |
-| Expiries | 8 active | Hardcoded EXPIRY_DATES |
-| Users | 1 (single-user) | Local Streamlit, no auth |
-| Data refresh | Manual / daily | No real-time feed |
-| Vol data | 4 expiries | 4 Excel files |
-
----
-
-## 11. Operational Runbook
-
-### 11.1 Daily Workflow
-
-```
-Pre-Market (automated):
-  API_intern.py runs via Task Scheduler
-    → FX.xlsx updated (EUR/USD)
-    → HistVolSB.xlsx updated (SB=F prices + RV)
-
-Morning (manual):
-  1. Open Terminal / Command Prompt
-     $ cd PricerLBSugar#11
-     $ streamlit run Cockpit.py
-
-  2. Select account (95135 / 95136 / 95137)
-
-  3. Set valuation date (defaults to today)
-
-  4. Enter current futures prices by expiry
-     (H26: 15.50, K26: 15.30, ...)
-
-  5. Review Main Book:
-     - Check Greeks ladder
-     - Review delta hedging recommendations
-     - Monitor live P&L attribution
-
-  6. Upload vol smile files (if updated from Barchart):
-     vol/VolH/K/N/Vbarchart.xlsx
-
-  7. Review Volatility Tools:
-     - Check ATM term structure
-     - Analyze skew (RR, BF)
-     - Compare IV vs 20d RV
-
-End of Day:
-  8. Close trades → update closed_book.xlsx
-  9. Save positions → Cockpit "Save" action
-  10. Archive books/{acct}/ to EmergencySavings/
-```
-
-### 11.2 Maintenance Tasks
-
-| Frequency | Task |
-|-----------|------|
-| Weekly | Verify API_intern.py logs for failures |
-| Monthly | Reconcile closed_book.xlsx with broker statements |
-| Quarterly | Add new year's EXPIRY_DATES to GreeksManagement.py |
-| Quarterly | Recalibrate DEFAULT_VOL dictionary |
-| Annually | Review model assumptions (r, storage_cost, day_count) |
-| Ad-hoc | Update file paths on new machine/OS |
-
-### 11.3 Running the Application
-
-```bash
-# Install dependencies (first time)
-pip install streamlit pandas numpy plotly matplotlib yfinance openpyxl
-
-# Launch dashboard
-streamlit run Cockpit.py
-
-# Run data pipeline manually
-python API_intern.py
+    SS1 & SS2 --> P1 & P4
+    SS3 --> T1
+    SS4 --> T2
 ```
 
 ---
 
-## 12. Known Limitations & Roadmap
+## 7. Volatility Surface Construction
 
-### 12.1 Current Limitations
+```mermaid
+flowchart LR
+    subgraph Raw["Raw Data — per expiry file\n(Barchart Cmdty manual export)"]
+        FILE["Vol{X}barchart.xlsx\nDelta_Call · ImplV_Call · Strike\nImplV_Put · Delta_Put"]
+    end
 
-| Category | Issue | Severity |
-|----------|-------|----------|
-| Infrastructure | Hardcoded absolute file paths | High |
-| Infrastructure | Excel-only persistence (no database) | High |
-| Infrastructure | Single-user, local Streamlit only | Medium |
-| Model | Constant volatility (no stochastic vol) | Medium |
-| Model | No arbitrage-free vol surface | Medium |
-| Model | No VaR / CVaR implementation | Medium |
-| Operations | No audit trail for trade entry | High |
-| Operations | No real-time data feed | Medium |
-| Operations | No unit tests | Medium |
-| Operations | No input validation on Excel | Medium |
-| Compliance | No trade confirmation workflow | High |
-| Compliance | No regulatory reporting | High |
+    subgraph Parse["Parsing & Normalization"]
+        REMAP["Column remapping\n(Unnamed: x → semantic names)"]
+        ATAG["Expiry tag extraction\nfrom filename → H/K/N/V"]
+        FMAP["ATM forward injection\nF_market[expiry]"]
+    end
 
-### 12.2 Technical Debt
+    subgraph Panel["Unified Vol Panel"]
+        DF["panel DataFrame\n[expiry · strike · delta_call · iv_call · iv_put · delta_put]"]
+    end
 
-- File paths must be parameterized via environment variables or config file
-- `DEFAULT_VOL` dictionary must be externalized to a config
-- Day count conventions are inconsistent across modules (365 vs 252)
-- Vol interpolation does not enforce no-arbitrage (calendar spread, butterfly)
-- `API_intern.py` uses Windows Task Scheduler; not portable to macOS/Linux
+    subgraph Analytics["Surface Analytics"]
+        ATM["ATM IV — interpolated at F"]
+        RR["Risk Reversal\nRR_25 = IV_25C − IV_25P\nRR_10 = IV_10C − IV_10P"]
+        BF["Butterfly\nBF_25 = ½(IV_25C + IV_25P) − ATM\nBF_10 = ½(IV_10C + IV_10P) − ATM"]
+        SLOPE["Smile Slopes\nslope_left · slope_right"]
+        CURV["Curvature\nBF proxy at selected Δ"]
+        SURF["3D Interpolation\nStrike × T axis → Plotly mesh"]
+        HEAT["Mispricing Heatmap\nIV(K) − ATM_IV  per expiry"]
+        RV["Realized Vol Overlay\n20d close-to-close vs ATM IV\nsource: API_data/HistVolSB.xlsx"]
+    end
 
-### 12.3 Priority Roadmap
-
-**Short-term (v1.1):**
-- [ ] Externalize config to `config.yaml` (paths, constants, accounts)
-- [ ] Add input validation layer for Excel position files
-- [ ] Implement basic logging throughout all modules
-- [ ] Add VaR (historical simulation) to P&L page
-
-**Medium-term (v1.2):**
-- [ ] Replace Excel data layer with SQLite or PostgreSQL
-- [ ] Add real-time futures price feed (Interactive Brokers API or Refinitiv)
-- [ ] Implement arbitrage-free vol interpolation (SVI / SABR)
-- [ ] Stress testing module (parallel vol shifts, price shock scenarios)
-
-**Long-term (v2.0):**
-- [ ] Stochastic volatility model (Heston or SABR)
-- [ ] Monte Carlo scenario engine
-- [ ] Multi-user support with RBAC and audit logging
-- [ ] FIX protocol integration for automated trade capture
-- [ ] Compliance reporting module
+    FILE --> REMAP --> ATAG --> FMAP --> DF
+    DF --> ATM & RR & BF & SLOPE & CURV & SURF & HEAT
+    RV -.->|"HistVolSB.xlsx"| HEAT
+```
 
 ---
 
-*PricerLBSugar#11 — Architecture Document — v1.0 — April 2026*  
-*Internal use only — Trading Desk*
+## 8. Contract & Expiry Reference
+
+| Code | Month   | First-Notice Rule                              |
+|------|---------|------------------------------------------------|
+| H    | March   | Last business day of the preceding month       |
+| K    | May     | Last business day of the preceding month       |
+| N    | July    | Last business day of the preceding month       |
+| V    | October | Last business day of the preceding month       |
+
+**Contract specs:** SB · ICE Futures US (IFUS) · 112,000 lbs per lot · US cents / lb · Tick 0.01 ¢/lb · Tick value USD 11.20
+
+**Coverage:** H26 (March 2026) through V34 (October 2034) — first-notice dates hardcoded in `EXPIRY_DATES`.
+
+---
+
+## 9. Module Responsibility Matrix
+
+| Module | Responsibility | Key Functions |
+|---|---|---|
+| `Cockpit.py` | Orchestration, routing, session state, UI layout | Page dispatch · `st.session_state` management · market input widgets |
+| `GreeksManagement.py` | Black-76 pricing, Greeks, hedge advisor, PnL explain | `build_greeks_dataframe` · `portfolio_delta_by_expiry` · `compute_pnl_explain` · `delta_hedge_action_by_expiry` |
+| `PnLComputation.py` | Realized P&L, EUR conversion, performance metrics | `build_daily_pnl_series` · `compute_sharpe` · `compute_max_drawdown` · `compute_pnl_by_year` |
+| `vol.py` | Vol surface construction, smile analytics, RV vs IV | `build_smile_panel_from_excels` · `compute_skew_metrics` · `plot_vol_surface` · `compute_vol_mispricing_map` |
+| `SavingsManagement.py` | Excel I/O, account-level data access | `load_open_positions` · `save_open_positions` · `load_closed_positions` |
+| `API_intern.py` | Scheduled market data ingestion (yfinance) | `download EURUSD=X → FX.xlsx` · `download SB=F → HistVolSB.xlsx` · `compute vol_CtoC_20d` |
+
+---
+
+## 10. Account & Portfolio Structure
+
+```mermaid
+graph LR
+    subgraph Accounts["Managed Accounts"]
+        A1["95135"]
+        A2["95136"]
+        A3["95137"]
+    end
+
+    subgraph Instruments["Instrument Types"]
+        FUT["fut — Futures"]
+        CALL["call — Call Options"]
+        PUT["put — Put Options"]
+    end
+
+    subgraph Expiries["Active Expiry Cycle  ·  ICE SB"]
+        E1["H  Mar"]
+        E2["K  May"]
+        E3["N  Jul"]
+        E4["V  Oct"]
+    end
+
+    A1 & A2 & A3 --> FUT & CALL & PUT
+    FUT & CALL & PUT --> E1 & E2 & E3 & E4
+```
+
+---
+
+## 11. Known Constraints & Design Decisions
+
+| Area | Decision | Rationale |
+|---|---|---|
+| Persistence | Excel workbooks (no database) | Zero-infrastructure deployment · audit-friendly flat files |
+| Pricing model | Black-76 with flat vol per expiry (default) | Industry standard for commodity options · smile loaded from Barchart when available |
+| Vol source | Barchart Cmdty manual export (`.xlsx`) | No live IV API · vol data requires manual refresh |
+| Market data | Yahoo Finance via `yfinance` (SB=F, EURUSD=X) | Free, automated daily feed for prices and realized vol |
+| Vol interpolation | Linear interpolation across strikes within each expiry | Sufficient for risk monitoring · no-arbitrage constraints not enforced |
+| RV computation | 20-day close-to-close, annualized (ACT/252) | Standard short-term realized vol benchmark vs ATM IV |
+| Session state | `st.session_state` as in-memory cache | Avoids recomputing Greeks on every widget interaction |
+| Deployment | `streamlit run Cockpit.py` — single process | Internal single-user tool · no concurrency requirements |
+| Data scheduler | Windows Task Scheduler (`API_intern.py`) | Simple local automation · not portable to macOS/Linux |
+| File paths | Dual-path (macOS / Windows) hardcoded | Multi-environment support · must be updated manually on new deployments |
+
+---
+
+*Source: `Cockpit.py` · `GreeksManagement.py` · `PnLComputation.py` · `vol.py` · `SavingsManagement.py` · `API_intern.py`*
