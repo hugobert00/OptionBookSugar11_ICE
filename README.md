@@ -37,7 +37,7 @@ A professional-grade Streamlit dashboard for managing ICE Sugar #11 (SB) futures
 - Per-leg Greeks and cost breakdown
 
 ### Automated Market Data Pipeline
-- Daily ingestion of **EUR/USD** (EURUSD=X) and **Sugar #11** (SB=F) prices via Yahoo Finance
+- Daily ingestion of **EUR/USD** (EURUSD=X) and **Sugar #11** (SB=F) prices via Yahoo Finance and Barchart (viaCmdity view)
 - Automatic computation of 20-day annualized realized volatility
 - Scheduled via Windows Task Scheduler (business days)
 
@@ -136,7 +136,8 @@ The app will open at `http://localhost:8501` in your browser.
 ```bash
 python API_intern.py
 ```
-
+## Automation -
+API run can be automated by using .bat files and task programmer in your computer.
 ---
 
 ## Tech Stack
@@ -147,15 +148,14 @@ python API_intern.py
 | Numerical computing | NumPy, pandas |
 | Visualization | Plotly, Matplotlib |
 | Options model | Black-76 |
-| Market data | yfinance (Yahoo Finance) |
+| Market data | yfinance (Yahoo Finance) and Barchart (viaCmdity view)|
 | Data storage | Excel (.xlsx) via openpyxl |
 | Language | Python 3.10+ |
 
 ---
 
 ## Disclaimer
-
-This project is an academic and personal portfolio project. The datasets included are **entirely fictional and anonymized** — no real client, account, or trade data is present in this repository. The tool is designed for educational and demonstration purposes.
+The datasets included are **entirely fictional and anonymized** — no real client, account, or trade data is present in this repository. The tool is designed for educational and demonstration purposes.
 
 ---
 
